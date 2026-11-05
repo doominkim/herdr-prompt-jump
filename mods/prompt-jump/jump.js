@@ -137,20 +137,30 @@ export async function jumpTo({ hc, sleep, scroll }, address, agent, prompts, ind
 // ------------------------------------------------------------ full-screen programs
 
 /**
- * Whether a full-screen program's view is at the bottom, from what it draws when scrolled up. Claude puts a
- * "Jump to bottom" hint (": fn+↓" or " (click) ↓", by version) on the rows just above its input box, which sits
- * between the last two separator rows. Elsewhere those words are transcript. Unknown (null) without an input
- * box or for a program with no known sign.
+ * Whether a full-screen program's view is at the bottom, from the hint it draws on the rows just above its
+ * input when scrolled up. Elsewhere those words are transcript. Unknown (null) without an input box or for a
+ * program with no known sign.
+ * - Claude: "Jump to bottom" (": fn+↓" or " (click) ↓", by version). The input box sits between the last two
+ *   separator rows.
+ * - Codex: "↓ Back to bottom · esc" ("New activity · " before it while working). The input starts on the last
+ *   row beginning with its marker "›"; a draft of several lines continues below it.
  */
 export function viewAtBottom(agent, lines) {
-  if (agent !== "claude") return null;
-  const seps = [];
-  lines.forEach((l, i) => {
-    if (/^─{20,}/.test(l)) seps.push(i);
-  });
-  if (seps.length < 2) return null;
-  const box = seps[seps.length - 2];
-  return !lines.slice(Math.max(0, box - 3), box).some((l) => l.includes("Jump to bottom"));
+  let box = -1;
+  let hint;
+  if (agent === "claude") {
+    const seps = [];
+    lines.forEach((l, i) => {
+      if (/^─{20,}/.test(l)) seps.push(i);
+    });
+    if (seps.length >= 2) box = seps[seps.length - 2];
+    hint = "Jump to bottom";
+  } else if (agent === "codex") {
+    for (let i = lines.length - 1; i >= 0 && box < 0; i--) if (lines[i].startsWith(MARKER.codex)) box = i;
+    hint = "↓ Back to bottom";
+  }
+  if (box < 0) return null;
+  return !lines.slice(Math.max(0, box - 3), box).some((l) => l.includes(hint));
 }
 
 /** Full-screen TUIs that draw their own view, so their screen says what is being read */

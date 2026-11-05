@@ -1,0 +1,6 @@
+{"type": "title", "title": "demo"}
+{"type": "session", "id": "s", "cwd": "/tmp"}
+{"type": "message", "id": "m1", "parentId": null, "message": {"role": "user", "content": [{"type": "text", "text": "omp first"}]}}
+{"type": "message", "id": "m2", "parentId": "m1", "message": {"role": "assistant", "content": [{"type": "toolCall", "name": "bash", "arguments": {}}, {"type": "text", "text": "omp answer"}]}}
+{"type": "message", "id": "m3", "parentId": "m2", "message": {"role": "user", "synthetic": true, "content": [{"type": "text", "text": "continue"}]}}
+{"type": "message", "id": "m4", "parentId": "m3", "message": {"role": "user", "content": [{"type": "text", "text": "omp second"}]}}

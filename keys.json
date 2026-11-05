@@ -1,5 +1,7 @@
 {
   "global": {
-    "f7": "layout.toggle:prompt-jump"
+    "f7": "layout.toggle:prompt-jump",
+    "cmd-shift-up": "prompt-jump.prev",
+    "cmd-shift-down": "prompt-jump.next"
   }
 }

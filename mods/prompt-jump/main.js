@@ -1,18 +1,38 @@
-// Prompt Jump: the prompts typed into the focused agent's session (Claude Code or omp), oldest first.
+// Prompt Jump: the prompts typed into the focused agent's session (Claude Code, Codex or omp), oldest first.
 // Clicking one scrolls that agent's terminal to it. Clicking this panel keeps the last agent shown.
+// `prompt-jump.prev` / `prompt-jump.next` (keys.json, cmd-shift-up/down) step from the last one jumped to.
 //
 // prompts.mjs (run with node) reads the list: terminal -> session file -> requests. Jumping runs
 // here, on Herdr's built-in hc (no shell, no node): jump.js scrolls Herdr's view of a terminal with
 // host history (omp) and pages a full-screen program (Claude's fullscreen TUI) by its own keys.
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { exec, hc, focused, terminals, agents, run, theme, appHome, notify } from "herdr";
-import { jumpTo } from "./jump.js";
+import { v_flex, h_flex, v_virtual_list, Scrollbar, VirtualListScrollHandle, InputState, Input } from "gpui-base";
+import { exec, hc, focused, terminals, agents, run, theme, appHome, notify, nextCommand, props, shared, setShared } from "herdr";
+import { jumpTo, neighbor, spyActive, screen, fullScreen, transcriptRows, viewAtBottom, isFullScreen, MARKER } from "./jump.js";
+import { searchPrompts } from "./search.js";
 
 const HELPER = () => `${appHome()}/mods/prompt-jump/prompts.mjs`;
-const SUPPORTED = new Set(["claude", "omp"]);
+const SUPPORTED = new Set(["claude", "codex", "omp"]);
+const LABEL = { claude: "Claude", codex: "Codex", omp: "omp" };
 const POLL_MS = 800;
 const WORKING_RELOAD_MS = 4000;
+const RELAY_KEY = "prompt-jump.relay";
+const STEP_KEY = "prompt-jump.step";
+// Another mod asks for a terminal's prompts: setShared("prompt-jump.open", { terminal, n: <unique> })
+const OPEN_KEY = "prompt-jump.open";
+const RELAY_BEAT_MS = 30000;
+const SHARED_MS = 120;
+const SPY_MS = 350;
+const ROW_HEIGHT = 44; // two 12px lines (34px) and 5px above and below
+
+/** -1 / +1 for the prev / next key commands, else null */
+const stepOf = (command) => ({ prev: -1, next: 1 })[String(command).split(".").pop()] ?? null;
+
+/** A relay heard from recently is the one forwarding keys */
+function relayAlive() {
+  const r = shared(RELAY_KEY);
+  return !!r && Date.now() - r.at < RELAY_BEAT_MS * 2.5;
+}
 
 /** "claude" | "omp" | null for a core terminal */
 function kindOf(t) {
@@ -20,6 +40,7 @@ function kindOf(t) {
   const argv = (t?.argv ?? []).join(" ");
   if (/claude/.test(app) || /(^|\/)claude(\s|$)/.test(argv)) return "claude";
   if (/^omp$/.test(app)) return "omp";
+  if (/^codex$/.test(app) || /(^|\/)codex(\s|$)/.test(argv)) return "codex";
   return app ? app : null;
 }
 
@@ -34,6 +55,23 @@ async function helper(args) {
 
 export default class PromptJump extends View {
   init(_props, cx) {
+    // The relay copy: an empty floating block that is always shown, so key commands reach it even while the
+    // panel is toggled off (Herdr delivers <mod>.<command> to shown copies only). It forwards each key
+    // through shared state to the panel, which stays alive while hidden.
+    this.relay = (props() ?? {}).role === "relay";
+    if (this.relay) {
+      const beat = () => setShared(RELAY_KEY, { at: Date.now() });
+      beat();
+      cx.timer.every(RELAY_BEAT_MS, () => beat());
+      cx.spawn(async () => {
+        let n = 0;
+        for (;;) {
+          const dir = stepOf(await nextCommand());
+          if (dir) setShared(STEP_KEY, { dir, n: `${Date.now()}-${++n}` });
+        }
+      });
+      return;
+    }
     this.target = null; // terminal address shown
     this.kind = null;
     this.title = "";
@@ -46,15 +84,134 @@ export default class PromptJump extends View {
     this.jumping = null;
     this.lastLoad = 0;
     this.lastStatus = null;
+    this.lastStep = shared(STEP_KEY)?.n ?? null; // a step forwarded before this copy started is not for it
+    this.lastOpen = shared(OPEN_KEY)?.n ?? null;
+    this.lastFocused = undefined; // the first poll counts as a focus change
+    this.scroll = VirtualListScrollHandle.new();
+    this.query = "";
+    this.searchBox = InputState.new({ placeholder: "Search prompts…" });
+    this.searchBox.on("change", (_e, acx) => {
+      this.query = this.searchBox.value();
+      acx.notify();
+    });
     cx.timer.every(POLL_MS, (acx) => this.poll(acx));
     this.poll(cx);
+    // Requests through shared state (the relay's keys, another mod's open). A hidden panel doesn't render,
+    // but its timers run: check here, often enough that a key feels immediate. Reading shared costs nothing.
+    cx.timer.every(SHARED_MS, (acx) => {
+      this.takeStep(acx);
+      this.takeOpen(acx);
+    });
+    // Claude and Codex draw their own view: read it to highlight the prompt being read
+    this.spySig = null;
+    this.jumpSig = null;
+    this.spying = false;
+    cx.timer.every(SPY_MS, (acx) => this.spy(acx));
+    // Keys straight to a shown panel, when no relay forwards them
+    cx.spawn(async (acx) => {
+      for (;;) {
+        const dir = stepOf(await nextCommand());
+        if (dir && !relayAlive()) this.step(dir, acx);
+      }
+    });
+  }
+
+  async close() {
+    if (this.relay) {
+      setShared(RELAY_KEY, null);
+      return;
+    }
+    this.searchBox.release();
+    this.scroll.release();
+  }
+
+  /** The prompts the list shows: all of them, or those matching the search box */
+  visible() {
+    return searchPrompts(this.prompts, this.query);
+  }
+
+  /**
+   * A request from another mod (a herdr-ticket session row) to list a terminal's prompts. The panel shows that
+   * terminal until a different agent terminal is focused, and shows itself if it was toggled off.
+   */
+  takeOpen(cx) {
+    const o = shared(OPEN_KEY);
+    if (!o || o.n === this.lastOpen) return;
+    this.lastOpen = o.n;
+    cx.spawn(async (acx) => {
+      const t = terminals().find((x) => x.address === o.terminal);
+      const kind = kindOf(t);
+      if (!t || !SUPPORTED.has(kind)) {
+        notify({ title: "Prompt Jump", body: `${o.terminal} is not a Claude Code, Codex or omp terminal`, level: "warning", timeout: 4000 });
+        return;
+      }
+      if (o.terminal !== this.target) this.select(o.terminal, kind, t, acx);
+      run("layout.show", { id: "prompt-jump" });
+    });
+  }
+
+  /**
+   * Highlight the prompt on the terminal's screen (Claude, Codex). Skipped while a jump runs, and until the screen
+   * changes after one: the jumped prompt may land low on screen, where the rule would pick the one before it.
+   */
+  spy(cx) {
+    if (this.spying || this.jumping !== null || !this.target || !isFullScreen(this.kind) || !this.prompts.length) return;
+    const address = this.target;
+    this.spying = true;
+    cx.spawn(async (acx) => {
+      try {
+        const all = await fullScreen(hc, address);
+        const rows = transcriptRows(all);
+        const sig = all.join("\n");
+        if (address !== this.target || sig === this.spySig || sig === this.jumpSig) return;
+        this.spySig = sig;
+        this.jumpSig = null;
+        // Compacted Claude prompts are not on screen: placing request lines must not count them
+        const onScreen = this.kind === "claude" ? this.prompts.filter((p) => !p.compacted) : this.prompts;
+        const index = spyActive(rows, MARKER[this.kind], onScreen, { atBottom: viewAtBottom(this.kind, all) === true });
+        if (index === null || index === this.active) return;
+        this.active = index;
+        const at = this.visible().findIndex((p) => p.index === index);
+        if (at >= 0) this.scroll.scroll_to_item(at, "center");
+        acx.notify();
+      } catch {
+        // A terminal that ended or can't be read: the next poll deals with it
+      } finally {
+        this.spying = false;
+      }
+    });
+  }
+
+  /** A key forwarded by the relay */
+  takeStep(cx) {
+    const s = shared(STEP_KEY);
+    if (!s || s.n === this.lastStep) return;
+    this.lastStep = s.n;
+    this.step(s.dir, cx);
+  }
+
+  /** Jump to the prompt before or after the last one jumped to (from the bottom when there is none) */
+  step(dir, cx) {
+    if (this.jumping !== null || !this.target) return;
+    // Steps stay inside the search results; a jumped prompt hidden by the search steps from the bottom
+    const shown = this.visible();
+    const from = shown.some((p) => p.index === this.active) ? this.active : null;
+    const index = neighbor(shown, from, dir, this.kind);
+    if (index === null) return;
+    // Keep the list on the row the key moved to
+    const at = shown.findIndex((p) => p.index === index);
+    if (at >= 0) this.scroll.scroll_to_item(at, "center");
+    this.jump(index, cx);
   }
 
   poll(cx) {
     const f = focused();
     const address = f?.terminal ?? null;
     const all = terminals();
-    if (address && address !== this.target) {
+    // Follow focus when it moves, not every poll: a terminal opened on request stays until focus changes
+    const moved = address !== this.lastFocused;
+    this.lastFocused = address;
+    if (moved && address && address !== this.target) {
       const t = all.find((x) => x.address === address);
       const kind = kindOf(t);
       if (kind && SUPPORTED.has(kind)) {
@@ -98,6 +255,9 @@ export default class PromptJump extends View {
     this.file = null;
     this.error = null;
     this.active = null;
+    // A search belongs to the session it was typed for
+    this.query = "";
+    this.searchBox.set_value("");
     this.lastStatus = agents().find((a) => a.address === address)?.status ?? null;
     this.load(cx);
     cx.notify();
@@ -119,6 +279,8 @@ export default class PromptJump extends View {
       if (address !== this.target) return;
       this.error = out.error ?? null;
       if (!out.error) {
+        // A new prompt was sent: the view follows it to the bottom, so stepping starts there again
+        if ((out.prompts ?? []).length > this.prompts.length && this.prompts.length) this.active = null;
         this.prompts = out.prompts ?? [];
         this.file = out.file ?? null;
         if (!out.file) this.error = "No session file found for this terminal";
@@ -163,12 +325,54 @@ export default class PromptJump extends View {
           timeout: 4000,
         });
       }
+      // The screen the jump left: the spy waits until it changes (the person scrolls or the agent writes)
+      if (out.found && isFullScreen(agent)) {
+        try {
+          this.jumpSig = (await fullScreen(hc, address)).join("\n");
+        } catch {}
+      }
       this.jumping = null;
       acx.notify();
     });
   }
 
-  render(_cx) {
+  row(p, t) {
+    const on = this.active === p.index;
+    const compacted = p.compacted && this.kind === "claude";
+    return h_flex()
+      .h(ROW_HEIGHT)
+      .items_start()
+      .gap(8)
+      .px(12)
+      .py(5)
+      .border_l(2)
+      .border_color(on ? t.accent : t.chrome)
+      .when(on, (el) => el.bg(t.selected))
+      .hover((s) => s.bg(t.hover))
+      // The start of the answer that followed, after resting the pointer on the row
+      .when(!!p.reply, (el) => el.tooltip(p.reply))
+      .child(
+        this.jumping === p.index
+          ? div().w(22).flex_none().text_size(11).text_color(t.accent).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 80)
+          : div().w(22).flex_none().text_size(11).text_color(on ? t.accent : t.dim).child(String(p.index + 1)),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .text_size(12)
+          .max_h(34)
+          .overflow_hidden()
+          .text_color(on ? t.foreground : compacted ? t.dim : t.muted)
+          .child(p.text.replace(/\s+/g, " ")),
+      )
+      .when(compacted, (el) =>
+        el.child(div().flex_none().px(5).rounded(4).bg(t.raised).text_size(10).text_color(t.dim).child("compacted")),
+      );
+  }
+
+  render(cx) {
+    if (this.relay) return div();
     const t = theme();
     const header = v_flex()
       .px(12)
@@ -193,7 +397,9 @@ export default class PromptJump extends View {
                   : this.loading
                     ? "Reading…"
                     : this.target
-                      ? `${this.prompts.length} prompt${this.prompts.length === 1 ? "" : "s"}`
+                      ? this.query.trim()
+                        ? `${this.visible().length} of ${this.prompts.length}`
+                        : `${this.prompts.length} prompt${this.prompts.length === 1 ? "" : "s"}`
                       : "",
               ),
           ),
@@ -204,82 +410,65 @@ export default class PromptJump extends View {
             .text_size(11)
             .text_color(t.muted)
             .truncate()
-            .child(`${this.kind === "omp" ? "omp" : "Claude"} · ${this.target} · ${this.title || ""}`),
+            .child(`${LABEL[this.kind] ?? this.kind} · ${this.target} · ${this.title || ""}`),
         ),
       )
       .when(!!this.unsupported, (el) =>
-        el.child(div().text_size(11).text_color(t.dim).child(`${this.unsupported} is not supported yet (Claude Code and omp only)`)),
+        el.child(div().text_size(11).text_color(t.dim).child(`${this.unsupported} is not supported yet (Claude Code, Codex and omp only)`)),
       );
 
     let body;
     if (!this.target) {
-      body = div().p(12).text_size(12).text_color(t.dim).child("Focus a Claude Code or omp terminal to list its prompts here");
+      body = div().p(12).text_size(12).text_color(t.dim).child("Focus a Claude Code, Codex or omp terminal to list its prompts here");
     } else if (this.error) {
       body = div().p(12).text_size(12).text_color(t.blocked ?? t.muted).child(this.error);
     } else if (this.prompts.length === 0) {
       body = div().p(12).text_size(12).text_color(t.dim).child(this.loading ? "" : "No prompts yet");
     } else {
+      const prompts = this.visible();
+      if (!prompts.length) {
+        body = div().p(12).text_size(12).text_color(t.dim).child("No prompts match the search");
+      } else {
+      // A virtual list with fixed-height rows, so a key step can bring its row into view (scroll_to_item).
+      // Rows can't carry handlers inside a virtual list: one on_item_click for the list, keyed by index.
       body = v_flex()
-        .id("prompt-jump-list")
+        .relative()
         .flex_1()
         .min_h(0)
-        .overflow_y_scrollbar()
-        .py(4)
-        .children(
-          this.prompts.map((p) => {
-            const on = this.active === p.index;
-            return h_flex()
-              .id(`prompt-jump-${p.index}`)
-              .items_start()
-              .gap(8)
-              .px(12)
-              .py(5)
-              .border_l(2)
-              .border_color(on ? t.accent : t.chrome)
-              .when(on, (el) => el.bg(t.selected))
-              .hover((s) => s.bg(t.hover))
-              .on_click((_e, cx) => this.jump(p.index, cx))
-              .child(
-                this.jumping === p.index
-                  ? div()
-                      .w(22)
-                      .flex_none()
-                      .text_size(11)
-                      .text_color(t.accent)
-                      .frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 80)
-                  : div()
-                      .w(22)
-                      .flex_none()
-                      .text_size(11)
-                      .text_color(on ? t.accent : t.dim)
-                      .child(String(p.index + 1)),
-              )
-              .child(
-                div()
-                  .flex_1()
-                  .min_w(0)
-                  .text_size(12)
-                  .max_h(34)
-                  .overflow_hidden()
-                  .text_color(on ? t.foreground : p.compacted && this.kind === "claude" ? t.dim : t.muted)
-                  .child(p.text.replace(/\s+/g, " ")),
-              )
-              .when(p.compacted && this.kind === "claude", (el) =>
-                el.child(
-                  div()
-                    .flex_none()
-                    .px(5)
-                    .rounded(4)
-                    .bg(t.raised)
-                    .text_size(10)
-                    .text_color(t.dim)
-                    .child("compacted"),
-                ),
-              );
-          }),
-        );
+        .child(
+          v_virtual_list("prompt-jump-list", prompts.length, ROW_HEIGHT, (i) => String(prompts[i].index), (range) =>
+            prompts.slice(range.start, range.end).map((p) => this.row(p, t)),
+          )
+            .size_full()
+            .track_scroll(this.scroll)
+            .on_item_click((key, cx) => this.jump(Number(key), cx)),
+        )
+        .child(Scrollbar.vertical("prompt-jump-list").absolute().inset_0());
+      }
     }
 
-    return v_flex().id("root").size_full().bg(t.chrome).child(header).child(body);
+    const search = div()
+      .px(12)
+      .py(8)
+      .border_b(1)
+      .border_color(t.border)
+      .child(
+        Input.new(this.searchBox)
+          .h(28)
+          .px(8)
+          .rounded(6)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.raised)
+          .text_size(12)
+          .accessibility_label("Search prompts"),
+      );
+    return v_flex()
+      .id("root")
+      .size_full()
+      .bg(t.chrome)
+      .child(header)
+      .when(!!this.target && !this.error && this.prompts.length > 0, (el) => el.child(search))
+      .child(body);
   }
 }

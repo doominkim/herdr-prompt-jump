@@ -9,7 +9,10 @@
 
 const norm = (s) => s.replace(/\s+/g, " ");
 
-export const MARKER = { claude: "❯", omp: "" };
+export const MARKER = { claude: "❯", codex: "›", omp: "" };
+
+/** Full-screen TUIs: no host history, and asking herdr-core for theirs costs seconds. They page first. */
+const FULL_SCREEN = new Set(["claude", "codex"]);
 
 /**
  * A request line starts with the request, after the program's prompt marker (Claude: "❯") or nothing but
@@ -33,6 +36,63 @@ export function findLine(lines, key, marker, n) {
   return -1;
 }
 
+/**
+ * The prompt a previous/next key goes to: `step` -1 or +1 from `from` (the last prompt jumped to; null means
+ * the view is at the bottom, past the latest prompt). Returns its index, or null when there is none that way.
+ */
+export function neighbor(prompts, from, step, agent) {
+  // Claude doesn't draw what came before a compaction: those prompts can't be jumped to
+  if (agent === "claude") prompts = prompts.filter((p) => !p.compacted);
+  if (from === null) return step < 0 ? (prompts[prompts.length - 1]?.index ?? null) : null;
+  const at = prompts.findIndex((p) => p.index === from);
+  if (at < 0) return null;
+  return prompts[at + step]?.index ?? null;
+}
+
+/**
+ * The request lines on screen with the prompt each one shows: [{row, index}], top first. Consecutive request
+ * lines are consecutive prompts, so a line whose first words name one prompt places the lines around it;
+ * identical prompts ("ok") get their place from it. Without such a line, each takes its first match.
+ */
+function placeOnScreen(lines, marker, prompts) {
+  const found = [];
+  lines.forEach((line, row) => {
+    const at = [];
+    prompts.forEach((p, pos) => {
+      if (isRequestLine(line, p.key, marker)) at.push(pos);
+    });
+    if (at.length) found.push({ row, at });
+  });
+  const anchor = found.findIndex((f) => f.at.length === 1);
+  return found.map((f, i) => {
+    let pos = f.at[0];
+    if (anchor >= 0) {
+      const want = found[anchor].at[0] + (i - anchor);
+      if (f.at.includes(want)) pos = want;
+    }
+    return { row: f.row, index: prompts[pos].index };
+  });
+}
+
+/**
+ * The prompt being read on a full-screen program's screen (`lines`: the transcript rows, top first), or null
+ * when the screen says nothing about it.
+ */
+export function spyActive(lines, marker, prompts, { atBottom = false } = {}) {
+  // At the bottom the latest answer is in view, whether or not its prompt still is
+  if (atBottom && prompts.length) return prompts[prompts.length - 1].index;
+  const seen = placeOnScreen(lines, marker, prompts);
+  if (!seen.length) return null;
+  // The latest prompt in view: the bottom is near, so its answer is the one being read
+  const latest = prompts[prompts.length - 1]?.index;
+  if (seen.some((s) => s.index === latest)) return latest;
+  const top = seen.filter((s) => s.row < lines.length / 2);
+  if (top.length) return top[top.length - 1].index;
+  // Only lower-half requests: what is above them is the answer to the request before the first one
+  const at = prompts.findIndex((p) => p.index === seen[0].index);
+  return at > 0 ? prompts[at - 1].index : seen[0].index;
+}
+
 async function json(hc, args) {
   const r = await hc([...args, "--json"]);
   if (r.code !== 0) throw new Error((r.stderr || r.stdout || `hc ${args[0]} failed`).trim());
@@ -51,9 +111,10 @@ export async function jumpTo({ hc, sleep, scroll }, address, agent, prompts, ind
   const marker = MARKER[agent] ?? "";
   // Later requests starting the same way sit below it; skip that many matches from the bottom
   const later = prompts.slice(index + 1).filter((p) => p.key === target.key).length;
-  // Asking a full-screen program's terminal for history costs about a second, and nothing cheaper says which kind
-  // it is. Claude (fullscreen TUI) pages first and falls back to history if its keys move nothing; omp has history.
-  if (agent === "claude") {
+  // Asking a full-screen program's terminal for history costs a second or more (Codex: about seven), and nothing
+  // cheaper says which kind it is. Claude and Codex page first and fall back to history if their keys move
+  // nothing; omp has host history.
+  if (FULL_SCREEN.has(agent)) {
     const paged = await pageTo({ hc, sleep }, address, marker, prompts, index, later);
     if (paged.found || paged.moved) return paged;
   }
@@ -69,17 +130,44 @@ export async function jumpTo({ hc, sleep, scroll }, address, agent, prompts, ind
     if (up > 0) await scroll({ terminal: address, lines: -up });
     return { mode: "history", found: true, up };
   }
-  if (agent === "claude") return { mode: "screen", found: false };
+  if (FULL_SCREEN.has(agent)) return { mode: "screen", found: false };
   return pageTo({ hc, sleep }, address, marker, prompts, index, later);
 }
 
 // ------------------------------------------------------------ full-screen programs
 
-/** The transcript part of the screen: the input box and status rows at the bottom are not */
-async function screen(hc, address) {
-  const lines = (await json(hc, ["read", address])).text.split("\n");
-  return lines.slice(0, Math.max(1, lines.length - 6));
+/**
+ * Whether a full-screen program's view is at the bottom, from what it draws when scrolled up. Claude puts a
+ * "Jump to bottom" hint (": fn+↓" or " (click) ↓", by version) on the rows just above its input box, which sits
+ * between the last two separator rows. Elsewhere those words are transcript. Unknown (null) without an input
+ * box or for a program with no known sign.
+ */
+export function viewAtBottom(agent, lines) {
+  if (agent !== "claude") return null;
+  const seps = [];
+  lines.forEach((l, i) => {
+    if (/^─{20,}/.test(l)) seps.push(i);
+  });
+  if (seps.length < 2) return null;
+  const box = seps[seps.length - 2];
+  return !lines.slice(Math.max(0, box - 3), box).some((l) => l.includes("Jump to bottom"));
 }
+
+/** Full-screen TUIs that draw their own view, so their screen says what is being read */
+export const isFullScreen = (agent) => FULL_SCREEN.has(agent);
+
+/** The transcript part of the screen: the input box and status rows at the bottom are not */
+export async function screen(hc, address) {
+  return transcriptRows(await fullScreen(hc, address));
+}
+
+/** Every row of the terminal's screen, input box and status rows included */
+export async function fullScreen(hc, address) {
+  return (await json(hc, ["read", address])).text.split("\n");
+}
+
+/** The transcript rows of a full screen: all but the last 6 */
+export const transcriptRows = (lines) => lines.slice(0, Math.max(1, lines.length - 6));
 
 /**
  * Press `key` and return the redrawn screen, or null if it didn't move (top or bottom reached, or keys the

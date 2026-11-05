@@ -81,6 +81,7 @@ function agentOf(term) {
   const argv = (term.foreground?.argv ?? []).join(" ");
   if (app === "claude-code" || app === "claude" || /(^|\/)claude(\s|$)/.test(argv)) return "claude";
   if (app === "omp" || /(^|\/)omp(\s|$)/.test(argv)) return "omp";
+  if (app === "codex" || /(^|\/)codex(\s|$)/.test(argv)) return "codex";
   return null;
 }
 
@@ -150,15 +151,80 @@ function ompSessionFile(pid, cwd, title) {
   return found[0]?.f ?? null;
 }
 
+/** Every process below `pid` (Codex's launcher runs the real binary as a child) */
+function descendants(pid) {
+  const out = [];
+  const queue = [pid];
+  while (queue.length && out.length < 200) {
+    const p = queue.shift();
+    let kids = "";
+    try {
+      kids = execFileSync("pgrep", ["-P", String(p)], { encoding: "utf8" });
+    } catch {}
+    for (const k of kids.split("\n").map(Number).filter(Boolean)) {
+      out.push(k);
+      queue.push(k);
+    }
+  }
+  return out;
+}
+
+const ROLLOUT = /\/\.codex\/(sessions|archived_sessions)\/.*\/rollout-[^/]*\.jsonl$/;
+
+/**
+ * Codex keeps its rollout file open while it runs, in the binary its launcher starts. Find it among the
+ * process tree's open files; without one, the newest rollout since the process started whose session_meta
+ * cwd is the terminal's folder.
+ */
+function codexSessionFile(pid, cwd) {
+  const open = [];
+  for (const p of [pid, ...descendants(pid)]) {
+    let names = "";
+    try {
+      names = execFileSync("lsof", ["-p", String(p), "-Fn"], { encoding: "utf8" });
+    } catch {}
+    for (const line of names.split("\n")) if (line.startsWith("n") && ROLLOUT.test(line.slice(1))) open.push(line.slice(1));
+  }
+  if (open.length) return open.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  const root = join(HOME, ".codex/sessions");
+  if (!existsSync(root)) return null;
+  const age = elapsedSeconds(pid);
+  const since = age === null ? 0 : Date.now() - (age + 60) * 1000;
+  const found = [];
+  const walk = (dir, depth) => {
+    for (const name of readdirSync(dir)) {
+      const f = join(dir, name);
+      if (depth < 3) {
+        try {
+          if (statSync(f).isDirectory()) walk(f, depth + 1);
+        } catch {}
+        continue;
+      }
+      if (!name.startsWith("rollout-") || !name.endsWith(".jsonl")) continue;
+      const st = statSync(f);
+      if (st.mtimeMs < since) continue;
+      try {
+        if (JSON.parse(headLines(f, 1)[0]).payload?.cwd === cwd) found.push({ f, mtime: st.mtimeMs });
+      } catch {}
+    }
+  };
+  walk(root, 0);
+  found.sort((a, b) => b.mtime - a.mtime);
+  return found[0]?.f ?? null;
+}
+
 export function resolveSession(address) {
   const term = hcJson(["get", address]);
   const agent = agentOf(term);
   const pid = term.foreground?.pid;
   if (!agent || !pid) return { agent, file: null };
+  const cwd = term.foreground?.cwd ?? term.cwd;
   const file =
     agent === "claude"
       ? claudeSessionFile(pid)
-      : ompSessionFile(pid, term.foreground?.cwd ?? term.cwd, String(term.title ?? ""));
+      : agent === "codex"
+        ? codexSessionFile(pid, cwd)
+        : ompSessionFile(pid, cwd, String(term.title ?? ""));
   return { agent, file };
 }
 
@@ -210,6 +276,10 @@ async function claudePrompts(path) {
       continue;
     }
     const m = l.message;
+    if (l.type === "assistant" && m?.role === "assistant" && !l.isSidechain) {
+      addReply(out, textBlocks(m.content, "text"));
+      continue;
+    }
     // isCompactSummary: the summary Claude feeds itself after a compaction, not something typed
     if (l.type !== "user" || m?.role !== "user" || l.isMeta || l.isSidechain || l.isCompactSummary) continue;
     const text = userTextOf(m.content);
@@ -242,11 +312,56 @@ async function ompPrompts(path) {
   const out = [];
   for (const r of ompActiveBranch(records)) {
     const m = r.type === "message" ? r.message : undefined;
+    if (m?.role === "assistant") {
+      addReply(out, textBlocks(m.content, "text"));
+      continue;
+    }
     if (!m || m.role !== "user" || m.synthetic) continue;
     const text = userTextOf(m.content);
     if (text) out.push({ text });
   }
   return out;
+}
+
+/** Codex rollout: the person's messages are `response_item` user messages (the `event_msg` copy is skipped) */
+async function codexPrompts(path) {
+  const out = [];
+  await eachJsonLine(path, (l) => {
+    const p = l.payload;
+    if (l.type !== "response_item" || p?.type !== "message") return;
+    if (p.role === "user") {
+      const text = userTextOf(p.content);
+      if (text) out.push({ text });
+    } else if (p.role === "assistant") addReply(out, textBlocks(p.content, "output_text"));
+  });
+  return out;
+}
+
+/** The text blocks of a message's content: `type` blocks (or plain `text`) with something in them */
+function textBlocks(content, type) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b) => b && (b.type === type || b.type === "text") && typeof b.text === "string" && b.text.trim())
+    .map((b) => b.text)
+    .join("\n\n");
+}
+
+const REPLY_MAX = 280;
+
+/** The first answer after the latest prompt becomes its reply preview (later ones in the turn are ignored) */
+function addReply(out, text) {
+  const last = out[out.length - 1];
+  const t = text.trim();
+  if (!last || last.reply !== undefined || !t) return;
+  last.reply = t.length > REPLY_MAX ? `${t.slice(0, REPLY_MAX)}…` : t;
+}
+
+/** The prompts of a session file, oldest first: [{text, reply?, compacted?}] */
+export function promptsOf(agent, path) {
+  if (agent === "claude") return claudePrompts(path);
+  if (agent === "codex") return codexPrompts(path);
+  return ompPrompts(path);
 }
 
 /**
@@ -266,16 +381,17 @@ export function screenKey(text) {
 export async function listPrompts(address) {
   const { agent, file } = resolveSession(address);
   if (!file) return { agent, file: null, prompts: [] };
-  const texts = agent === "claude" ? await claudePrompts(file) : await ompPrompts(file);
+  const texts = await promptsOf(agent, file);
   return {
     agent,
     file,
-    prompts: texts.map(({ text: raw, compacted }, index) => {
+    prompts: texts.map(({ text: raw, reply, compacted }, index) => {
       const t = listText(raw);
       return {
       index,
       text: t.length > 300 ? `${t.slice(0, 300)}…` : t,
       key: screenKey(raw),
+      ...(reply ? { reply } : {}),
       ...(compacted ? { compacted: true } : {}),
       };
     }),

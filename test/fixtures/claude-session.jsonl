@@ -1,0 +1,9 @@
+{"type": "user", "uuid": "u1", "parentUuid": null, "isSidechain": false, "message": {"role": "user", "content": "first question"}}
+{"type": "assistant", "uuid": "a1", "parentUuid": "u1", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "answer one"}, {"type": "tool_use", "name": "Bash", "input": {}}]}}
+{"type": "user", "uuid": "t1", "parentUuid": "a1", "isSidechain": false, "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok", "tool_use_id": "x"}]}}
+{"type": "assistant", "uuid": "a1b", "parentUuid": "t1", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "more about one"}, {"type": "tool_use", "name": "Bash", "input": {}}]}}
+{"type": "user", "uuid": "u2", "parentUuid": "a1b", "isSidechain": false, "message": {"role": "user", "content": "second, abandoned by a rewind"}}
+{"type": "assistant", "uuid": "a2x", "parentUuid": "u2", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "answer to the abandoned one"}, {"type": "tool_use", "name": "Bash", "input": {}}]}}
+{"type": "user", "uuid": "u2b", "parentUuid": "a1b", "isSidechain": false, "message": {"role": "user", "content": "second, sent again"}}
+{"type": "attachment", "uuid": "at1", "parentUuid": "u2b"}
+{"type": "assistant", "uuid": "a2", "parentUuid": "at1", "isSidechain": false, "message": {"role": "assistant", "content": [{"type": "text", "text": "answer two"}, {"type": "tool_use", "name": "Bash", "input": {}}]}}

@@ -1,0 +1,7 @@
+{"type": "session_meta", "payload": {"id": "s1", "cwd": "/tmp/demo"}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>"}, {"type": "input_text", "text": "<environment_context>\n  <cwd>/tmp/demo</cwd>\n</environment_context>"}]}}
+{"type": "event_msg", "payload": {"type": "user_message", "message": "What is a hash map?"}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "What is a hash map?"}]}}
+{"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "A key-value store."}]}}
+{"type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": "{}"}}
+{"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "And a linked list?"}]}}

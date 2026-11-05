@@ -43,7 +43,7 @@ and the keys to `keys.json` (as in this repo's `keys.json`):
     "cmd-shift-down": "prompt-jump.next" } }
 ```
 
-The keys reach a mod only while it is shown. To keep them working with the panel toggled off, add an empty floating relay to the layout's root node. It draws nothing, and it hands each key to the panel, which keeps running while hidden:
+The keys reach a mod only while it is shown. To keep them working with the panel toggled off, add an empty floating relay to the layout's root node. It draws nothing, and it hands each key to the panel, which keeps running while hidden. A hidden panel that hasn't started yet (it starts the first time it is shown after the app or the mod loads) is shown by the first key, which it then takes; toggle it off again and later keys work with it hidden:
 
 ```json
 "floating": [ { "id": "prompt-jump-relay", "edge": "bottom", "align": "end",
@@ -70,7 +70,7 @@ Prompt filtering follows [Illithid](https://github.com/doominkim/illithid)'s tra
 - **A prompt is matched on screen by its first 40 characters**, at the start of a prompt line. Prompts that start the same way are told apart by their order. Pasted content can render differently from the saved text and may not be found.
 - **Two omp sessions in the same folder with the same title** can be confused.
 - **omp's scroll position can't be followed.** omp uses Herdr's terminal history, and Herdr gives mods no way to read where that view is scrolled. For omp the highlight is the last prompt jumped to.
-- **The step keys need the panel shown, or the relay.** Herdr delivers a mod's commands to shown copies only. A hidden panel starts the first time it is shown after the app (or the mod) loads, so show it once before stepping with it hidden.
+- **The step keys need the panel shown, or the relay.** Herdr delivers a mod's commands to shown copies only. With the relay, the first key after the app (or the mod) loads shows the panel if it hasn't been shown yet, because a hidden copy doesn't start until then.
 - Clicking a Claude Code prompt sends `ctrl+home`/`ctrl+end`/`pageup`/`pagedown` to that terminal. They move its view, not its input.
 
 ## For other mods

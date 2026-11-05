@@ -10,6 +10,7 @@ import { v_flex, h_flex, v_virtual_list, Scrollbar, VirtualListScrollHandle, Inp
 import { exec, hc, focused, terminals, agents, run, theme, appHome, notify, nextCommand, props, shared, setShared } from "herdr";
 import { jumpTo, neighbor, spyActive, screen, fullScreen, transcriptRows, viewAtBottom, isFullScreen, MARKER } from "./jump.js";
 import { searchPrompts } from "./search.js";
+import { alive, waking } from "./relay.js";
 
 const HELPER = () => `${appHome()}/mods/prompt-jump/prompts.mjs`;
 const SUPPORTED = new Set(["claude", "codex", "omp"]);
@@ -17,10 +18,12 @@ const LABEL = { claude: "Claude", codex: "Codex", omp: "omp" };
 const POLL_MS = 800;
 const WORKING_RELOAD_MS = 4000;
 const RELAY_KEY = "prompt-jump.relay";
+const PANEL_KEY = "prompt-jump.panel";
 const STEP_KEY = "prompt-jump.step";
 // Another mod asks for a terminal's prompts: setShared("prompt-jump.open", { terminal, n: <unique> })
 const OPEN_KEY = "prompt-jump.open";
 const RELAY_BEAT_MS = 30000;
+const PANEL_BEAT_MS = 10000;
 const SHARED_MS = 120;
 const SPY_MS = 350;
 const ROW_HEIGHT = 44; // two 12px lines (34px) and 5px above and below
@@ -29,10 +32,7 @@ const ROW_HEIGHT = 44; // two 12px lines (34px) and 5px above and below
 const stepOf = (command) => ({ prev: -1, next: 1 })[String(command).split(".").pop()] ?? null;
 
 /** A relay heard from recently is the one forwarding keys */
-function relayAlive() {
-  const r = shared(RELAY_KEY);
-  return !!r && Date.now() - r.at < RELAY_BEAT_MS * 2.5;
-}
+const relayAlive = () => alive(shared(RELAY_KEY), RELAY_BEAT_MS, Date.now());
 
 /** "claude" | "omp" | null for a core terminal */
 function kindOf(t) {
@@ -57,7 +57,8 @@ export default class PromptJump extends View {
   init(_props, cx) {
     // The relay copy: an empty floating block that is always shown, so key commands reach it even while the
     // panel is toggled off (Herdr delivers <mod>.<command> to shown copies only). It forwards each key
-    // through shared state to the panel, which stays alive while hidden.
+    // through shared state to the panel, which stays alive while hidden. A panel copy starts only once it is
+    // shown, so with no panel beating, the key shows it and the starting copy takes that key.
     this.relay = (props() ?? {}).role === "relay";
     if (this.relay) {
       const beat = () => setShared(RELAY_KEY, { at: Date.now() });
@@ -67,11 +68,18 @@ export default class PromptJump extends View {
         let n = 0;
         for (;;) {
           const dir = stepOf(await nextCommand());
-          if (dir) setShared(STEP_KEY, { dir, n: `${Date.now()}-${++n}` });
+          if (!dir) continue;
+          const at = Date.now();
+          const wake = !alive(shared(PANEL_KEY), PANEL_BEAT_MS, at);
+          setShared(STEP_KEY, wake ? { dir, n: `${at}-${++n}`, at, wake } : { dir, n: `${at}-${++n}`, at });
+          if (wake) run("layout.show", { id: "prompt-jump" });
         }
       });
       return;
     }
+    const beat = () => setShared(PANEL_KEY, { at: Date.now() });
+    beat();
+    cx.timer.every(PANEL_BEAT_MS, () => beat());
     this.target = null; // terminal address shown
     this.kind = null;
     this.title = "";
@@ -84,7 +92,9 @@ export default class PromptJump extends View {
     this.jumping = null;
     this.lastLoad = 0;
     this.lastStatus = null;
-    this.lastStep = shared(STEP_KEY)?.n ?? null; // a step forwarded before this copy started is not for it
+    // A step forwarded before this copy started is not for it, unless it is the one that showed it
+    const lastStep = shared(STEP_KEY);
+    this.lastStep = lastStep && !waking(lastStep, Date.now()) ? lastStep.n : null;
     this.lastOpen = shared(OPEN_KEY)?.n ?? null;
     this.lastFocused = undefined; // the first poll counts as a focus change
     this.scroll = VirtualListScrollHandle.new();
@@ -121,6 +131,7 @@ export default class PromptJump extends View {
       setShared(RELAY_KEY, null);
       return;
     }
+    setShared(PANEL_KEY, null);
     this.searchBox.release();
     this.scroll.release();
   }
@@ -182,10 +193,11 @@ export default class PromptJump extends View {
     });
   }
 
-  /** A key forwarded by the relay */
+  /** A key forwarded by the relay. The one that showed this panel waits for its first list. */
   takeStep(cx) {
     const s = shared(STEP_KEY);
     if (!s || s.n === this.lastStep) return;
+    if (waking(s, Date.now()) && (!this.target || this.loading || !this.lastLoad)) return;
     this.lastStep = s.n;
     this.step(s.dir, cx);
   }

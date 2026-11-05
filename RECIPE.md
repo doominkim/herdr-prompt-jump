@@ -24,7 +24,9 @@ A panel beside the terminals that lists, oldest first, the prompts the person ty
 - Every 800ms it checks `focused().terminal` and follows it only when focus has moved. A newly focused terminal whose agent is Claude Code, Codex or omp becomes the panel's session. Anything else keeps the last session: a shell, this panel itself (clicking it makes `terminal` null) or another mod. A terminal opened on request (`prompt-jump.open`) therefore stays until focus moves.
 - Claude Code and Codex: every 350ms the panel reads the session's screen (plain `hc read`, transcript rows = all but the last 6). When the screen changed, it highlights the prompt being read (`jump.js` `spyActive`) and centers its row:
   - Placing lines: consecutive request lines are consecutive prompts. A line matching exactly one prompt anchors the lines around it, so identical prompts get their place.
-  - At the bottom, it is the latest prompt, even with its line scrolled off. Claude is scrolled up only when "Jump to bottom" (`: fn+↓` or ` (click) ↓`, by version) appears within the 3 rows above its input box, which sits between the last two `─` separator rows. The same words elsewhere are transcript. For Codex the bottom is unknown.
+  - At the bottom, it is the latest prompt, even with its line scrolled off. The same words away from the input are transcript:
+    - Claude is scrolled up only when "Jump to bottom" (`: fn+↓` or ` (click) ↓`, by version) appears within the 3 rows above its input box, which sits between the last two `─` separator rows.
+    - Codex is scrolled up only when "↓ Back to bottom · esc" ("New activity · " before it while working) appears within the 3 rows above its input, which starts on the last row beginning with `›`. Codex also pins the request whose answer is at the top of the view to the first row.
   - If the latest prompt is on screen, it is the latest.
   - Otherwise, the last request line in the top half.
   - Otherwise, with request lines only in the bottom half, the prompt before the first one.
@@ -35,7 +37,8 @@ A panel beside the terminals that lists, oldest first, the prompts the person ty
 - Search keeps the prompts containing every whitespace-separated word of the query, ignoring case (`search.js`). It is cleared when the session changes.
 - A row's `tooltip` is the first assistant text after that prompt, up to 280 characters plus "…". Tool calls are skipped; a prompt not answered yet has none.
 - Keys and open requests go through shared state, which every 120ms timer tick reads, because a hidden panel doesn't render but its timers run:
-  - The relay copy (`props.role: "relay"`, an empty floating block) takes `prev`/`next` from `nextCommand()` and writes `prompt-jump.step` `{dir, n}`. It beats `prompt-jump.relay` `{at}` every 30s.
+  - The relay copy (`props.role: "relay"`, an empty floating block) takes `prev`/`next` from `nextCommand()` and writes `prompt-jump.step` `{dir, n, at}`. It beats `prompt-jump.relay` `{at}` every 30s.
+  - Each panel copy beats `prompt-jump.panel` `{at}` every 10s from its start and clears it on close. With no beat within 25s, the relay adds `wake: true` to the step and runs `layout.show {id: "prompt-jump"}`. The copy that starts takes a waking step younger than 5s (`relay.js` `waking`), once its first list has loaded. Any other step written before a copy started is not for it.
   - A shown panel acts on its own `nextCommand()` only when no relay has beaten within 75s.
   - `prompt-jump.open` `{terminal, n}` from another mod selects that terminal and runs `layout.show {id: "prompt-jump"}`.
 - The list reloads when the session's agent status changes, and every 4s while it is `working`.
@@ -68,7 +71,7 @@ A panel beside the terminals that lists, oldest first, the prompts the person ty
 - `hc keys` paces keys at about 33ms each. Sending several keys in one call is no faster than separate calls.
 - When the app first sees a mod folder without `mod.json`, it docks a copy into the layout by itself. Install the folder whole (`install-mod.sh` builds it aside, then moves it).
 - Run node by name through `exec`. The app's environment must have it on `PATH`.
-- A hidden panel copy starts only the first time it is shown after the app or the mod loads; until then, nothing takes the relay's keys.
+- A hidden panel copy starts only the first time it is shown after the app or the mod loads. That is why the relay shows it on a key when no panel beats.
 - Inside a virtual list's row renderer, `on_click` throws; `tooltip(text)` (a string) is fine.
 - `pane.focus` from a shell races the person using the window. Don't script screenshots of the panel while someone works in it.
 
@@ -80,7 +83,7 @@ A panel beside the terminals that lists, oldest first, the prompts the person ty
 - Clicking an omp prompt still in history scrolls it to the top of the view.
 - Two identical prompts ("ok" twice) each jump to their own place.
 - With the panel shown, `cmd-shift-up` from the bottom jumps to the latest prompt and highlights it, and the next press goes one earlier.
-- With the panel hidden but started once, `cmd-shift-up` steps the focused session, and opening the panel shows the stepped row.
+- With the panel hidden and not yet shown since the app started, `cmd-shift-up` shows the panel and steps the focused session. With it hidden after that, `cmd-shift-up` steps without showing it, and opening the panel shows the stepped row.
 - `setShared("prompt-jump.open", {terminal, n})` from another mod shows the panel with that terminal while focus stays put.
 - Scrolling a Claude Code terminal up moves the highlight to the prompt whose answer is in view.
 - Typing two words in the search keeps only prompts containing both.

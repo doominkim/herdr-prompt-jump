@@ -70,7 +70,26 @@ test("the same words written in the transcript, away from the input box, are not
   assert.equal(viewAtBottom("claude", lines), true);
 });
 
+test("Codex is scrolled up when its Back to bottom hint sits just above the input line", () => {
+  const foot = ["", "  GPT-6-Astra medium Fast · Custom permissions · weekly 96% left", "  ← for agents · ? for shortcuts"];
+  const body = ["› <hc from=\"t8p\">Reply with the numbers</hc>", "  85", "  86"];
+  const hint = " ".repeat(60) + "↓ Back to bottom · esc";
+  const busy = " ".repeat(60) + "New activity · ↓ Back to bottom · esc";
+  assert.equal(viewAtBottom("codex", [...body, "  Worked for 10s • 21:33", "", "", "› Ask Codex to do anything", ...foot]), true);
+  assert.equal(viewAtBottom("codex", [...body, "• Working (2s • esc to interrupt)", "", "", "› Ask Codex to do anything", ...foot]), true);
+  assert.equal(viewAtBottom("codex", [...body, hint, "", "› Ask Codex to do anything", ...foot]), false);
+  assert.equal(viewAtBottom("codex", [...body, busy, "", "› Ask Codex to do anything", ...foot]), false);
+  // A draft of several lines grows the input below its first line
+  assert.equal(viewAtBottom("codex", [...body, hint, "", "› hi", "  two", ...foot]), false);
+});
+
+test("Codex's hint words in the transcript, away from the input line, are not the hint", () => {
+  const lines = ["  press ↓ Back to bottom to return", "  a", "  b", "  c", "", "› Ask Codex to do anything", "", "  status"];
+  assert.equal(viewAtBottom("codex", lines), true);
+});
+
 test("without an input box to place the hint, or for another program, the bottom is unknown", () => {
   assert.equal(viewAtBottom("claude", ["  just text"]), null);
   assert.equal(viewAtBottom("codex", ["  some answer"]), null);
+  assert.equal(viewAtBottom("omp", ["  some answer"]), null);
 });

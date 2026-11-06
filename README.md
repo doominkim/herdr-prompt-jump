@@ -84,6 +84,9 @@ setShared("prompt-jump.open", { terminal: "t7", n: String(Date.now()) }); // n: 
 
 The panel shows that terminal (and itself, if toggled off) until a different agent terminal is focused.
 
+Keep the empty floating relay from the installation section mounted for cold opening. It wakes a panel that has never started, and marks only the fresh request for that new copy; handled or expired requests are not replayed. The public payload remains `terminal` and a unique `n`. A running hidden panel continues to consume requests directly.
+
+
 ## Files
 
 - `mods/prompt-jump/main.js`: the panel.

@@ -13,3 +13,16 @@ export function alive(beat, period, now) {
 export function waking(step, now) {
   return !!step?.wake && now - step.at < WAKE_MS;
 }
+
+/** A newly requested terminal needs the relay only when no panel copy is running. */
+export function forwardOpenRequest(request, seen, panelBeat, period, now) {
+  if (!request || request.n === seen) return null;
+  return { ...request, at: now, wake: !alive(panelBeat, period, now) };
+}
+
+/** Cold-start only consumes a fresh relay wake; persisted and handled requests stay ignored. */
+export function initialOpenNonce(request, now) {
+  const age = now - request?.at;
+  return request?.wake === true && Number.isFinite(request.at) && age >= 0 && age < WAKE_MS
+    ? null : request?.n ?? null;
+}

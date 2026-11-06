@@ -10,7 +10,7 @@ import { v_flex, h_flex, v_virtual_list, Scrollbar, VirtualListScrollHandle, Inp
 import { exec, hc, focused, terminals, agents, run, theme, appHome, notify, nextCommand, props, shared, setShared } from "herdr";
 import { jumpTo, neighbor, spyActive, screen, fullScreen, transcriptRows, viewAtBottom, isFullScreen, MARKER } from "./jump.js";
 import { searchPrompts } from "./search.js";
-import { alive, waking } from "./relay.js";
+import { alive, waking, forwardOpenRequest, initialOpenNonce } from "./relay.js";
 
 const HELPER = () => `${appHome()}/mods/prompt-jump/prompts.mjs`;
 const SUPPORTED = new Set(["claude", "codex", "omp"]);
@@ -64,6 +64,16 @@ export default class PromptJump extends View {
       const beat = () => setShared(RELAY_KEY, { at: Date.now() });
       beat();
       cx.timer.every(RELAY_BEAT_MS, () => beat());
+      this.lastOpen = shared(OPEN_KEY)?.n ?? null;
+      cx.timer.every(SHARED_MS, () => {
+        const request = forwardOpenRequest(shared(OPEN_KEY), this.lastOpen, shared(PANEL_KEY), PANEL_BEAT_MS, Date.now());
+        if (!request) return;
+        this.lastOpen = request.n;
+        if (request.wake) {
+          setShared(OPEN_KEY, request);
+          run("layout.show", { id: "prompt-jump" });
+        }
+      });
       cx.spawn(async () => {
         let n = 0;
         for (;;) {
@@ -95,7 +105,7 @@ export default class PromptJump extends View {
     // A step forwarded before this copy started is not for it, unless it is the one that showed it
     const lastStep = shared(STEP_KEY);
     this.lastStep = lastStep && !waking(lastStep, Date.now()) ? lastStep.n : null;
-    this.lastOpen = shared(OPEN_KEY)?.n ?? null;
+    this.lastOpen = initialOpenNonce(shared(OPEN_KEY), Date.now());
     this.lastFocused = undefined; // the first poll counts as a focus change
     this.scroll = VirtualListScrollHandle.new();
     this.query = "";
@@ -149,6 +159,7 @@ export default class PromptJump extends View {
     const o = shared(OPEN_KEY);
     if (!o || o.n === this.lastOpen) return;
     this.lastOpen = o.n;
+    if (o.wake) setShared(OPEN_KEY, { ...o, wake: false });
     cx.spawn(async (acx) => {
       const t = terminals().find((x) => x.address === o.terminal);
       const kind = kindOf(t);
@@ -288,7 +299,10 @@ export default class PromptJump extends View {
         out = { error: String(e?.message ?? e) };
       }
       this.loading = false;
-      if (address !== this.target) return;
+      if (address !== this.target) {
+        this.load(acx);
+        return;
+      }
       this.error = out.error ?? null;
       if (!out.error) {
         // A new prompt was sent: the view follows it to the bottom, so stepping starts there again
